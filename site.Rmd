@@ -1,0 +1,561 @@
+---
+title: "Deduplicating Algorithm"
+knit: (function(input_file, encoding) {
+  out_dir <- 'docs';
+  rmarkdown::render(input_file,
+ encoding=encoding,
+ output_file=file.path(dirname(input_file), out_dir, 'index.html'))})
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(DT)
+library(vroom)
+```
+
+
+
+
+The overall goal of the deduplicating process is to identify the true owner of every rental property in Cleveland. This is tougher than it sounds. The main complicating factor is that a person or entity (e.g., a business or nonprofit) can own multiple properties under any number of different aliases. Further complications include data entry errors and inconsistencies, e.g. misspellings and abbreviations, in the county tax billing file, which can make it difficult to determine who truly owns a particular property, and whether that person/entity also owns other properties. 
+
+# Generate pool of similar parcel-pairs
+The first step in the deduplicating process is to, one at a time, compare every parcel in Cleveland against every other parcel in Cleveland to generate a pool of parcel-pairs that bear some (user-defined) minimum resemblance to one another based on two pieces of information from the county tax billing file:
+
+* property owner name 
+* tax mailing address 
+
+## The Process
+
+* Start with: *191,452* parcels
+* Drop 3994 CMHA parcels
+* Drop 38699 "government/other" parcels
+    * parcels that no longer exist (e.g., merged with a neighboring parcel)
+    * Owned by an entity associated with city/county/state government
+        * This includes many, but not all of the state forefeiture cases; obviously not all, given our recent conversations. Unfortunately, the way these cases are listed in the owner field is pretty inconsistent, so I missed some. 
+* Remaining: **148,821** parcels
+
+Comparing every parcel against every other parcel is computationally expensive, so instead, we compare each unique combination of property owner name and tax mailing address against every other unique name/address combination. There were **116,994** unique name/address combinations.
+
+The end product is a dataset containing the parcel identifiers, primary owner names, and tax mailing addresses of each parcel 'A' and parcel 'B', as well as calculated measures of the similarity between name A and name B, and between address A and address B. 
+
+The similarity between two strings of text can be calculated with a number of string distance (sd) metrics. Here, I use the Jaro-Winkler (JW) distance, which is a measure of the edit distance between two strings  is normalized to values ranging from 0 (identical strings) to 1 (no similarity). JW treats similarities occurring at the beginning of two strings as especially important when calculating similarity scores, so to take advantage of this feature, I split each name string into it's individual word components, arranged them alphabetically, and recombined them into a single, alphabetized string. So, for example, if I owned two properties, one as "Michael Henderson", and the other as "Henderson Michael", the comparisonn would be made between the alphabetized version ("Henderson Michael" vs "Henderson Michael")
+
+If we kept the result of every parcel-pair comparison, we'd be left with a dataset of nearly 7 billion rows:
+
+```{r}
+sum(seq(116994,1))
+```
+
+
+Retaining everything is neither practical nor desirable, given that the vast majority of parcels have nothing in common with one another aside from a Cleveland address. All we really care about is the subset of parcel-pairs that, at the very least, are superficially similar enough to merit further inspection to determine whether they are owned by the same entity or not. So, I added a decision rule to the algorithm that discards the obvious nonmatches, and retains only those parcel-pair comparisons that indicate some similarity. 
+
+Landing on a good break point between "obviously not a match" and "superficially similar enough" took some trial and error. Briefly, I took several random subsets of the property data, and ran them through the algorithm several times, each time tuning the algorithm to retain/discard cases at different levels of name/address similarity. I examined the weakest matches of each iteration, and determined that if a large proportion of the retained cases were obviously unrelated parcels, the specification was too weak; if the weakest cases still contained a sprinkling of plausible matches, too strong. After repeating this process, I decided that the following specification struck a good balance: 
+
+* sd between owner names < .1, or
+* sd between addresses < .03, or
+* addresses have the same street number (i.e., the 11402 in 11402 Bellflower Rd), *and* 
+    * sd between street names (i.e. just "Bellflower") < .1
+
+With this specification, the algorithm retained **288,528** of the ~6.85 billion parcel-pairs (.004%) for further review.
+
+
+# Create variables for closer inspection of parcel-pairs
+
+To the dataset of potentially matching parcel-pairs generated in the previous step, I generated a wide variety of additional measures for examining the similarity between each name- and address-pair in much greater detail. My goal was/is to create a sufficient number of indicator variables describing the degree of relationship between two name/address strings, to be able to classify a list of names & addresses as being associated with the same person/entity, without ever referring to the specifics of the data itself. 
+
+That goal is still a work in progress, but it's come a long way. Here are some of the key indicators I came up with for describing the relationships between two name/address strings.
+
+## Name relationship variables:
+
+* sds between names
+    * sd1: Full cleaned name, words alphabetized (used to generate pool of potential matches) 
+    * sd_orig_name: Full cleaned name, words in original order 
+    * sd_big_name_alpha: Alphabetized name, drop any 1-2 character words (i.e., initials)
+    * sd_big_name_alpha_nd: Alphabetized name, drop any 1-2 character words and any numeric characters
+    
+
+* Initials/digits from name string (initial1, initial1_x, initial2, etc)
+    * "John Smith" vs "John Smith": who knows if they're the same person or two different people
+    * "John M Smith" vs "John M Smith": more likely to be the same person, but still not certain
+    * "John M Smith 386 LLC" vs "JM Smith 386 LLC": most likely the same entity
+    * "John M Smith" vs "John Q Smith": definitely different people
+    
+* shared_words: a count of the words that appear in both strings
+* common_elements: a string containing all the words common to both names
+* unique_elements_a: a string containing all the words that appear in name A only
+* unique_elements_b: a string containing all the words that appear in name B only
+* name_rank_unique (1,2,3, a,b): how common are the names that occur in only a or in only b? 
+  * calculated by parsing out the owner name field into it's component words (3+ characters)every individual word (3+ characters), counting the number of occurrences of each word, and assigning a rank from 1 (most common) to 60569 (~50k words only occurring once)
+      * ex: 1:James...2:Michael...7:Mary...138:Julie...9272:Shoemaker......60569
+* name_rank_common: how common are tha names that occur in both a and b?
+
+* common_length: length (number of characters) of string common_elements
+* unique_length_a/b: length of strings unique_elements_a/b
+
+* Name shingles- break each name down into its 2-consecutive character subcomponents: "MI" "IC" "CH" "HA" "AE" "EL" "L " " H" "HE"
+    * count of shingles in name A
+    * count of shingles in name B
+    * count of shingles common to both A and B
+    * percentage of shingles in A that also occur in B
+    * percentage of shingles in B that also occur in A
+    
+
+## Address relationship variables
+
+* sds between addresses
+    * sd2: full address (11402 BELLFLOWER RD)
+    * sd_addr_no_suffix: excluding street type (11402 BELLFLOWER)
+    * sd_street_name: street name only (BELLFLOWER)
+    
+* tma_count_nosuffix/tma_count_rank_nosuffix: Count & rank of tax mailing addresses by number of associated parcels
+    * Ex: 2999 PAYNE AVENUE, the CHN HQ is ranked #2
+
+
+## Location variables
+
+* same_tax_zip: tax mailing addresses in the same zip code
+* same_tax_census: tax mailing addresses in the same census tract (for cuyahoga tax mailing addresses only)
+* same_loc_zip: parcels located in the same zip code
+
+## Other variables
+
+* owner_type/owner_type_x: corporate or person
+* luc2018/luc2018_x: land use code of parcel
+* tma_luc/tma_luc_x: land use code of tax mailing address location (only available for tax mailing addresses in cuyahoga county)
+
+
+# Classify parcel-pairs as matches/nonmatches
+
+With many new variables in hand for teasing out the subtle differences between the names/addresses in each parcel-pair, the next step is to create a set of rules for classifying each parcel-pair as "matches" or "non-matches". To be clear, a parcel-pair is classified as a match if we feel pretty confident that both parcels are owned by the same person or entity. 
+
+The property owner names listed in the tax billing file take a number of different forms & patterns depending on whether the owner is a person, multiple individuals, a nonprofit, church, LLC, etc. Given these differences, it was all but impossible to craft a set of decision rules that could correctly classify the entire pool of parcel-pairs as matches/nonmatches. 
+
+
+
+Thus, I carved the dataset into five pieces to which unique sets of decision rules could be applied based on the owner type and property type: 
+
+```{r echo=FALSE}
+matching_subsets <- tibble(
+  `Owner Type` = c(
+    "Person vs. Person", 
+    "Person vs. Person", 
+    "Corporate vs. Corporate",
+    "Corporate vs. Corporate", 
+    "Corporate vs. Person/Person vs. Corporate"
+                   ), 
+  `Property Type` = c(
+    "1-3 family dwelling vs. 1-3 family dwelling", 
+    "all remaining (i.e., not 1-3 family dwelling)",
+    "1-3 family dwelling vs. 1-3 family dwelling", 
+    "all remaining (i.e., not 1-3 family dwelling)",
+    "all property types"
+    )
+)
+
+datatable(matching_subsets)
+```
+
+
+## Classification- universal rules  
+
+Before splitting the dataset into the five subsets just described, I applied a set of classification rules that could be applied to all parcels without concern about property or owner type: 
+
+* variable is_match coded to 1 if: 
+    * sd == 0 for either the alphabetized (sd1) or original name (sd_orig_name) *AND* 
+    * sd == 0 for any of the tax mailing address variants (sd2, sd_addr_no_suffix, sd_street_name)
+
+* is_match coded to 0 if: 
+    * <= 20% of the shingles in name A also found in name B *AND*
+    * <= 20% of the shingles in name B also found in name A 
+    
+Excluding the parcel-pairs classified by the above rules, I divided the remaining parcel-pairs into the five subsets. 
+
+I followed an iterative process to classify the parcel-pairs in each subset. I began each iteration by arranging the dataset according to some combination of the variables described earlier (e.g. by address sd, and then within each value of address sd, by name sd). Then, I examined the names and addresses of the observations at the top and bottom of the sorted data. If the top or bottom of the dataset was consistently populated by clearly matching parcel-pairs (or by obvious nonmatches), I scrolled up/down until I found the point at which the pattern broke down (i.e. from all obvious matches to a mix of of obvious matches and less clear cases), and tried to figure out how to isolate the chunk of consistent matches/nonmatches using the variables in the dataset. I then added this combination of variable-values as a new decision rule in the code. 
+
+After each iteration, I extracted the successfully classified observations, and then tried different sorting combinations on the remaining, unclassified parcel-pairs. I repeated this process until there were no more parcels to classify. 
+    
+
+Below is the code for the iterative classification process, preceded by a table containing a random sample of 100 matching parcel-pairs (is_match == 1), and 100 non-matching parcel-pairs (is_match == 0). 
+
+Unfortunately, it is clear that at certain points, it became impossible to rearrange the data in such a way that groups of only matching, and groups of only nonmatching observations could be isolated. In these cases, I resorted to referring to "exceptions to the rule", by the specific contents of the name/address fields. This is not a good practice in terms of reproducible science, but at a certain point, I just threw up my hands and said, "it is what it is." 
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+dat <- vroom(here::here("data", "match_samp.csv"))
+dat <- dat %>% select(-c(tma_count, tma_count_rank, tma_count_x, tma_count_rank_x, most_common_name_rank, most_common_word_rank, addr_no_suffix_18, addr_no_suffix_18_x, street_name, street_name_x, total_words_in_name:digit2, digit1_x, digit2_x, addr_num, addr_num_x:po_last_count_18_x, big_name_alpha:big_name_alpha_nodig_x, sd_name_diff:sd_street_name_diff, sd_ans2 ))
+
+
+
+dat <- dat %>% 
+  arrange(min_addr_dist, min_name_dist)
+
+datatable(dat)
+
+
+```
+
+
+Person-person matching - 1-3 family homes
+```{r eval=F, echo=T}
+xbp_home <- xb %>% 
+  filter(owner_type == "person" & owner_type_x == "person" & luc2018 %in% c("Single family dwelling", "Two family dwelling", "Three family dwelling") & luc2018_x %in% c("Single family dwelling", "Two family dwelling", "Three family dwelling"))
+
+xbp_home2 <- xbp_home %>% 
+    mutate(is_match = case_when(
+    sd1 == 0 | # identical alphabetized name
+      (common_initial == 1 & sd_big_name_alpha < .02) | # share >0 initial in common, nearly identical names (initials omitted)
+      (min_addr_dist == 0 & shared_words == 0 & sd1 < .268) | # captures weird name misspellings- ex: ONeil vs O Neil
+      (!is.na(rank_n_1) & sd2 == 0) | # have >0 human names in common, same tax address
+      ((pct_of_shingles_matching == 1 | pct_of_shingles_matching_x == 1) & min_addr_dist == 0) |
+      ((sd2 == 0 | min_addr_dist == 0) & shared_words > 0 & common_length > 1 & common_elements != "TRUSTEE") | 
+      (common_length > 19) | 
+      (min_addr_dist == 0 & min_name_dist < 0.21666667) | 
+      (pct_of_shingles_matching < .5 & pct_of_shingles_matching_x < .5 & min_addr_dist >0 & sd1 < .049) | 
+      (str_detect(po_name3, "MC(?![:alpha:])") & str_detect(po_name3_x, "MC(?=[:alpha:])")) | 
+      (min_addr_dist==0 & pct_of_shingles_matching > .79) | 
+      (min_addr_dist==0 & tma_count < 7 & min_name_dist < .262) |
+      (min_addr_dist==0 & tma_count < 7 & (pct_of_shingles_matching > .5 | pct_of_shingles_matching_x > .5)) | 
+      (min_addr_dist==0 & tma_count < 7 & 
+              ( str_detect(po_name3, "COTRONAKIS") & str_detect(po_name3_x, "COTTONAKIS") | 
+      str_detect(po_name3, "VESELENAK") & str_detect(po_name3_x, "VESELNAK") | 
+      str_detect(po_name3, "POINDEXTER") & str_detect(po_name3_x, "POINTDEXTER") | 
+      str_detect(po_name3, "GINNIS") & str_detect(po_name3_x, "GINNIS") | 
+      str_detect(po_name3, "LIOGKV") & str_detect(po_name3_x, "LIOGKY") | 
+      str_detect(po_name3, "TAWNYA") & str_detect(po_name3_x, "TAWNYA") |
+      str_detect(po_name3, "TIBURZI") & str_detect(po_name3_x, "TIBURZA") |
+      str_detect(po_name3, "ZADRAVEC") & str_detect(po_name3_x, "ZADRAVAC") |
+      str_detect(po_name3, "GILNER") & str_detect(po_name3_x, "GILLNER") |
+      str_detect(po_name3, "GILNER") & str_detect(po_name3_x, "GILMER") |
+      str_detect(po_name3, "GILMER") & str_detect(po_name3_x, "GILNER") |
+      str_detect(po_name3, "CAMARGO") & str_detect(po_name3_x, "CARNARGO") |
+      str_detect(po_name3, "DABYDEEN") & str_detect(po_name3_x, "DABYBEEN") |
+      str_detect(po_name3_x, "COTRONAKIS") & str_detect(po_name3, "COTTONAKIS") | 
+      str_detect(po_name3_x, "VESELENAK") & str_detect(po_name3, "VESELNAK") | 
+      str_detect(po_name3_x, "POINDEXTER") & str_detect(po_name3, "POINTDEXTER") | 
+      str_detect(po_name3_x, "GINNIS") & str_detect(po_name3, "GINNIS") | 
+      str_detect(po_name3_x, "LIOGKV") & str_detect(po_name3, "LIOGKY") | 
+      str_detect(po_name3_x, "TAWNYA") & str_detect(po_name3, "TAWNYA") |
+      str_detect(po_name3_x, "TIBURZI") & str_detect(po_name3, "TIBURZA") |
+      str_detect(po_name3_x, "ZADRAVEC") & str_detect(po_name3, "ZADRAVAC") |
+      str_detect(po_name3_x, "GILNER") & str_detect(po_name3, "GILLNER") |
+      str_detect(po_name3_x, "CAMARGO") & str_detect(po_name3, "CARNARGO") |
+      str_detect(po_name3_x, "DABYDEEN") & str_detect(po_name3, "DABYBEEN") ) |
+        (min_addr_dist == 0 & pct_of_shingles_matching > .5 & pct_of_shingles_matching_x > .5) | 
+       ( min_name_dist == 0 & common_initial == 1) | 
+       ( min_name_dist == 0 & 
+           !str_detect(tma_patched_address_18, "WEST ([:digit:])") & 
+           !str_detect(tma_patched_address_18_x, "WEST ([:digit:])") & 
+           !str_detect(tma_patched_address_18, "EAST ([:digit:])") & 
+           !str_detect(tma_patched_address_18_x, "EAST ([:digit:])") & 
+           same_loc_zip==1) | 
+       ( sd_street_name==0 & pct_of_shingles_matching>.5 & pct_of_shingles_matching_x> .5 & (rank_n_1 > 78 | rank_n_2 > 78)) | 
+        (rank_n_1 > 100 & rank_n_2>100) | 
+        (rank_n_2 > 721 & (same_tax_zip== 1 | same_loc_zip==1)) | 
+        (common_length > 18) | 
+        (shared_words > 2) | 
+        (rank_n_1 > 15226) | 
+        (rank_n_2 > 860)  |
+        (stringdist(str_squish(str_remove_all(po_name3, "ETAL|TRUSTEE")), str_squish(str_remove_all(po_name3_x, "ETAL|TRUSTEE")), method = "jw" )==0) | 
+       ( rank_n_1 > 3000)
+        
+
+         ) 
+      
+      
+    ~1, 
+    
+    
+    (common_length == 0 & min_name_dist > .4) | 
+    (min_name_dist > 0 & min_addr_dist > 0 & shared_words==0)  | 
+          ((sd2 == 0 | min_addr_dist == 0) & shared_words > 0 & common_length > 1 & common_elements == "TRUSTEE") | 
+      (pct_of_shingles_matching == 0) | 
+      (pct_of_shingles_matching < .5 & pct_of_shingles_matching_x < .5 & min_addr_dist >0 & sd1 > .049) | 
+      (tma_patched_address_18 == tma_patched_address_18_x & common_length==1) | 
+      (min_addr_dist==0 & tma_count < 7) | 
+      (min_addr_dist == 0) | 
+      (min_name_dist == 0 & initial1 !=initial1_x) | 
+      (sd_street_name==0 ) | 
+      (str_detect(po_name3, "ETAL") & str_detect(po_name3_x, "ETAL")) | 
+      (common_length <3) | 
+      (same_tax_zip !=1 & same_loc_zip !=1)
+      
+
+      ~ 0, 
+    
+    TRUE ~ 0
+    
+  ))
+
+
+xbp_remaining <- xbp_home2 %>% 
+  filter(is.na(is_match))
+
+m2 <- xbp_home2 %>% 
+  filter(is_match == 1)
+table(m2$is_match)
+
+# rm(xbp_remaining, xbp_home2)
+```
+
+
+
+## person-person matching- not 1-3 family homes
+
+```{r, eval=F, echo=T}
+
+
+xbp_condo <- xb %>% 
+  filter(owner_type == "person" & owner_type_x == "person" ) %>% 
+  anti_join(xbp_home)
+
+# rm(xbp_remaining, xbp_home2)
+
+xbpc <- xbp_condo %>% 
+  mutate(is_match = case_when(
+    (shared_words > 0 & common_length > 1 & rank_n_1 > 50 & min_name_dist==0 ) | 
+      (same_loc_zip==1 & common_length > 2) | 
+      ((rank_n_1 > 100 | rank_n_2 > 100) & common_length > 10 & common_initial ==1) | 
+      (common_length > 15) | 
+      (min_addr_dist==0 & pct_of_shingles_matching > .49 & rank_n_1 > 91) | 
+      (min_addr_dist==0 & pct_of_shingles_matching > .5999) | 
+      (min_addr_dist == 0 & tma_count < 20 & !is.na(rank_n_1)) | 
+      (pct_of_shingles_matching < .35 & pct_of_shingles_matching_x < .35 & common_elements == "YU" ) | 
+      (min_addr_dist > 0 & rank_n_1 >= 15093) | 
+      (rank_n_2 > 500) | 
+      (same_loc_zip==1 & min_name_dist < .05) | 
+      (same_loc_zip==1 & (str_detect(po_name3, "ROSTISLAV") | str_detect(po_name3_x, "ROSTISLAV"))) 
+      
+    ~1, 
+    
+    ((min_addr_dist == 0 & min_name_dist > .5)) | 
+      (pct_of_shingles_matching == 0) | 
+      (str_detect(po_name3, "ETAL") | str_detect(po_name3_x, "ETAL") ) |
+      (pct_of_shingles_matching < .35 & pct_of_shingles_matching_x < .35 ) | 
+      (str_length(unique_elements_a) == 1 & str_length(unique_elements_b) == 1) |# identical except for initial (mike j fox vs. mike d fox)
+      (min_addr_dist == 0)
+      
+
+      
+          ~0, 
+    TRUE ~ 0
+  ))
+
+c_rem <- xbpc %>% 
+  filter(is.na(is_match))
+m3 <- xbpc %>% 
+  filter(is_match == 1)
+```
+
+
+
+
+
+
+
+corporate-corporate matching- 1-3 family homes
+```{r, eval=F, echo=T}
+xbc_home <- xb %>% 
+  filter(owner_type == "corporate" & owner_type_x == "corporate" & luc2018 %in% c("Single family dwelling", "Two family dwelling", "Three family dwelling") & luc2018_x %in% c("Single family dwelling", "Two family dwelling", "Three family dwelling"))
+
+xbc_home <- xbc_home %>% 
+  mutate(
+    unique_diff = stringdist(unique_elements_a, unique_elements_b, method = "jw")) %>%
+  select(po_name3:unique_elements_b, unique_diff, everything())
+
+  xbc_home2 <- xbc_home %>% 
+    mutate(is_match = case_when(
+      
+      (sd1 == 0 | sd_orig_name == 0) | 
+        (min_addr_dist==0 & !str_detect(po_name3, "BISHOP") & !str_detect(po_name3_x, "BISHOP") & (pct_of_shingles_matching > .9 | pct_of_shingles_matching_x > .9)) | 
+        (str_detect(po_name3, "CLEVELAND GREEN") & str_detect(po_name3_x, "CLEVELAND GREEN")) | 
+        (sd_street_name==0 & (pct_of_shingles_matching > .9 | pct_of_shingles_matching_x > .9)) | 
+        (shared_words < 3 & common_length > 3 & !str_detect(common_elements, "HOLDING|MANAGEMENT|PROPERTY|ESTATE|INVESTMENT|GROUP|ASSOC|VENTURE|PARTNERSHIP|ENTERPRISE|INVEST|CAPITAL|VENDOR|RENTAL|REHAB|SALES|MARKETING") & !str_detect(unique_elements_a, "[:digit:]") & unique_diff < .194) | 
+       ( unique_diff < .075) | 
+        (is.na(unique_diff) & same_addr_num==1) | 
+        (common_length > 46 & unique_diff < .45) | 
+        (unique_elements_a == "MMGT" | unique_elements_b=="MMGT") |
+        (str_detect(po_name3, "HOUGH") & str_detect(po_name3_x, "HOUGH")) |
+        (str_detect(po_name3, "FRANCOO") & str_detect(po_name3_x, "FRANCOO")) |
+        (str_detect(po_name3, "HUMANITY") & str_detect(po_name3_x, "HUMANITY")) |
+        (str_detect(po_name3, "GLENVILLE") & str_detect(po_name3_x, "GLENVILLE")) |
+        (str_detect(po_name3, "WOKUTCH") & str_detect(po_name3_x, "WOKUTCH")) |
+        (str_detect(po_name3, "MAHADEW|MAHADEV") & str_detect(po_name3_x, "MAHADEW|MAHADEV")) |
+        (str_detect(po_name3, "CLEVELAND CO") & str_detect(po_name3_x, "CLEVELAND CO")) |
+        (str_detect(po_name3, "CLEVELAND") & str_detect(po_name3_x, "CLEVELAND") & 
+        str_detect(po_name3, "HO") & str_detect(po_name3_x, "HO")) | 
+           
+        (min_name_dist < .27 & same_tax_zip == 1 & same_loc_zip==1)
+        
+         
+      
+      
+    ~1, 
+    (min_addr_dist == 0) | 
+    (min_name_dist > .27 & same_tax_zip == 1 & same_loc_zip==1)
+    
+    ~0, 
+    TRUE ~ 0)
+    ) 
+
+
+
+
+xr <- xbc_home2 %>% 
+  filter(is.na(is_match))
+
+m4 <- xbc_home2 %>% 
+  filter(is_match == 1)
+
+```
+
+
+## corporate - not 1-3 family homes
+
+```{r, eval=F, echo=T}
+
+
+xbc_condo <- xb %>% 
+  filter(owner_type == "corporate" & owner_type_x == "corporate" ) %>% 
+  anti_join(xbc_home)
+
+xbc_condo <- xbc_condo %>% 
+  mutate(
+    unique_diff = stringdist(unique_elements_a, unique_elements_b, method = "jw"), 
+    unique_length_a = str_length(unique_elements_a), 
+    unique_length_b = str_length(unique_elements_b), 
+    unique_length_diff = abs(unique_length_a-unique_length_b)) %>%
+  select(po_name3:unique_elements_b, unique_diff, everything())
+
+
+xbcc <- xbc_condo %>% 
+  mutate(is_match = case_when(
+    (sd1==0 | sd_orig_name==0) | 
+      (min_addr_dist==0 & common_length > 0) | 
+      (min_addr_dist == 0 & min_name_dist < .3) |# this is where things got sloppy
+        (str_detect(po_name3, "CLEVELAND HO|CLEELAND HO") & str_detect(po_name3_x, "CLEVELAND HO|CLEELAND HO")) |
+      (!str_detect(unique_elements_a, "[:digit:]") & unique_diff < .3) | 
+      (sd_street_name==0 & !str_detect(po_name3, "[:digit:]")) |
+      (sd_street_name==0 & str_extract(po_name3, "[:digit:]+") == str_extract(po_name3_x, "[:digit:]+")) |
+      (min_addr_dist < .03) | 
+      (same_addr_num==1 & min_name_dist < .25) | 
+      (!is.na(rank_n_2)) | 
+      (same_addr_num==1) |
+      (str_detect(po_name3, "FOUNDATION") & str_detect(po_name3_x, "FOUNDATION")) | 
+      (str_detect(po_name3, "BD CLEVE") ) |
+        (str_detect(tma_patched_address_18, "BOX") & str_detect(tma_patched_address_18_x, "BOX")) |
+      (str_detect(po_name3, "CLEV") & str_detect(po_name3_x, "CLEV") & shared_words > 1) |
+      (str_detect(po_name3, "BD C") & str_detect(po_name3_x, "BD C")) |
+      (str_detect(po_name3, "EDUCATION") & str_detect(po_name3_x, "EDUCATION")) |
+      (str_detect(po_name3, "SALVATION") & str_detect(po_name3_x, "SALVATION")) |
+      (str_detect(po_name3, "BOARD") & str_detect(po_name3_x, "BOARD")) |
+      (str_detect(po_name3, "GAS") & str_detect(po_name3_x, "GAS")) |
+      (str_detect(po_name3, "OHIO") & str_detect(po_name3_x, "OHIO")) |
+      (str_detect(po_name3, "PPG") & str_detect(po_name3_x, "PPG")) |
+      (str_detect(po_name3, "MOBILE") & str_detect(po_name3_x, "MOBILE")) |
+      (str_detect(po_name3, "HOSPITAL") & str_detect(po_name3_x, "HOSPITAL")) |
+      (str_detect(po_name3, "CATHOLIC|GARDENS|EUCLID|ORIANA|BEULAH|PILGRIM|CLAIR|SARDIS|NORRIS|WILLIAMS|KENNETH|HOSPICE|CHEMTRADE|BEGINNING |ACRES")) | 
+      (is.na(rank_n_1))
+      
+    
+    
+    ~ 1, 
+    
+      (min_addr_dist == 0 & min_name_dist > .3)  | 
+      (min_name_dist > .3) |
+      (!str_detect(unique_elements_a, "[:digit:]") & unique_diff > .3) | 
+      (min_addr_dist==0) | 
+      (str_detect(po_name3, "HOLDING") & str_detect(po_name3_x, "HOLDING"))  |
+      (sd_street_name==0 ) | 
+      (str_detect(unique_elements_a, "[:digit:]") | str_detect(unique_elements_b, "[:digit:]"))
+
+      
+    ~0, 
+    TRUE ~ 0
+  ))
+
+
+rem <- xbcc %>% 
+  filter(is.na(is_match))
+  
+m5 <- xbcc %>% 
+  filter(is_match == 1)
+
+```
+
+
+
+## corporate-person matching
+
+```{r, eval=F, echo=T}
+last <- xb %>% 
+  anti_join(xbp_home) %>% 
+  anti_join(xbp_condo) %>% 
+  anti_join(xbc_home) %>% 
+  anti_join(xbc_condo)
+
+last <- last %>% select(po_name3, po_name3_x, sd1, sd_orig_name, min_name_dist, tma_patched_address_18, tma_patched_address_18_x, sd2,
+                        min_addr_dist, tma_count_nosuffix, tma_count_nosuffix_x, pct_of_shingles_matching, pct_of_shingles_matching_x,
+                        common_length, shared_words, common_elements:unique_elements_b, everything())
+
+
+l2 <- last %>% 
+  mutate(is_match = case_when(
+    (shared_words > 0 & min_addr_dist == 0 & common_length > 2) | 
+      (sd1 == 0 | sd_orig_name==0) |
+      (min_addr_dist == 0 &( pct_of_shingles_matching==1 | pct_of_shingles_matching_x==1)) | 
+      (str_detect(po_name3, "NHI|CLEV") & str_detect(po_name3_x, "NHI|CLEV")) | 
+      (str_detect(tma_patched_address_18, "2999 P") & str_detect(tma_patched_address_18_x, "2999 P") & str_detect(po_name3, "NHI|CLEV|GREEN|HOUSING|PARTNER|(?<![:graph:])CHN") & str_detect(po_name3_x, "NHI|CLEV|GREEN|HOUSING|PARTNER|(?<![:graph:])CHN")) |
+      (min_addr_dist > 0 & sd_street_name==0 & min_name_dist < .4 & (pct_of_shingles_matching >.6 | pct_of_shingles_matching_x > .6) & pct_of_shingles_matching >.11 & pct_of_shingles_matching_x > .11) | 
+     ( shared_words > 3) | 
+      (str_count(po_name3, ("CASE|WESTERN|WESTREN|RESERVE|UNIVERSITY|MHC|MHP|MILLER")) > 1 & str_count(po_name3_x, ("CASE|WESTERN|WESTREN|RESERVE|UNIVERSITY|MHC|MHP|MILLER")) > 1) | 
+      (str_detect(po_name3, "BISHOP") & str_detect(po_name3_x, "BISHOP")) |
+      (str_detect(po_name3, "EMERALD") & str_detect(po_name3_x, "EMERALD")) |
+      (str_detect(po_name3, "NORFOLK") & str_detect(po_name3_x, "NORFOLK")) | 
+      (str_count(po_name3, "IPLAN|GROUP|I PLAN")==2 & str_count(po_name3_x, "IPLAN|GROUP|I PLAN")==2) | 
+      (str_count(po_name3, "DEV|ECON|EMERA")>2 & str_count(po_name3_x, "DEV|ECON|EMERA")>2 ) | 
+      (min_name_dist < .09  & (str_detect(unique_elements_a, "TRUST") |str_detect(unique_elements_b, "TRUST") )) | 
+      (str_detect(po_name3, "ANITA B THOMAS|THOCU|GRAYLAIN|OLDE RIVER|LAND RACH") & str_detect(po_name3_x, "ANITA B THOMAS|THOCU|GRAYLAIN|OLDE RIVER|LAND RACH")) | 
+      (str_detect(po_name3, "RENAISSANCE|ALLEGHENY|SAC SELF SIX|ALIBERTI|MILLENIO|KAFANTARIS|IMPALA|BURNING BUSH") & str_detect(po_name3_x, "RENAISSANCE|ALLEGHENY|SAC SELF SIX|ALIBERTI|MILLENIO|KAFANTARIS|IMPALA|BURNING BUSH")) | 
+      (str_detect(tma_patched_address_18, "8481 SETTLERS") & str_detect(tma_patched_address_18_x, "8481 SETTLERS")) | 
+      (min_addr_dist == 0 & min_name_dist < .303) |
+      (min_addr_dist == 0 & str_detect(tma_patched_address_18, "BOX")) |
+      (str_detect(po_name3, "RTA|A R T") & str_detect(po_name3_x, "RTA|A R T")) | 
+      (min_addr_dist == 0 & tma_count_nosuffix < 26 & pct_of_shingles_matching>.27 & pct_of_shingles_matching_x > .27) |
+      (min_addr_dist == 0 & (str_detect(po_name3, "BISHOP|DIOCESE|REVEREND") |str_detect(po_name3_x, "BISHOP|DIOCESE|REVEREND") )) | 
+      (min_addr_dist == 0 & tma_count_nosuffix < 35 & str_detect(tma_patched_address_18, "^[:digit:]") & (pct_of_shingles_matching >=.5 | pct_of_shingles_matching_x >=.5)) | 
+      (min_addr_dist == 0 & tma_count_nosuffix < 26)
+      
+    
+    ~ 1, 
+    
+    (pct_of_shingles_matching < .25 & pct_of_shingles_matching_x < .25)  | 
+      (str_detect(tma_patched_address_18, "2999 P") & str_detect(tma_patched_address_18_x, "2999 P") & (str_detect(po_name3, "NHI|CLEV|GREEN|HOUSING|PARTNER|(?<![:graph:])CHN") | str_detect(po_name3_x, "NHI|CLEV|GREEN|HOUSING|PARTNER|(?<![:graph:])CHN"))) | 
+      (pct_of_shingles_matching <= .35 & pct_of_shingles_matching_x <= .35) | 
+      (min_addr_dist > 0 & sd_street_name == 0)  | 
+      (str_detect(tma_patched_address_18, "10301 LAKE") & str_detect(tma_patched_address_18_x, "10301 LAKE")) | 
+      ((str_detect(tma_patched_address_18, "EAST") & str_detect(tma_patched_address_18_x, "WEST"))|(str_detect(tma_patched_address_18, "WEST") & str_detect(tma_patched_address_18_x, "EAST"))) | 
+      (min_addr_dist == 0 & tma_patched_address_18 == "X PERSONAL PROP") | 
+      (min_addr_dist == 0 & (str_detect(po_name3, "NICKEL PLATE") |str_detect(po_name3_x, "NICKEL PLATE") )) |
+      (min_addr_dist == 0 & (str_detect(po_name3, "BANK") & !str_detect(po_name3_x, "BANK")) | (str_detect(po_name3_x, "BANK") & !str_detect(po_name3, "BANK"))) | 
+      (min_addr_dist == 0 & tma_count_nosuffix > 100)
+    ~0, 
+    TRUE ~ 0
+    
+  ))
+
+l3 <- l2 %>% 
+  filter(is.na(is_match))
+rm(l3)
+
+
+m6 <- l2 %>% 
+  filter(is_match == 1)
+
+rm(xbc_condo, xbc_home, xbc_home2, xbcc, xbp_condo, xbp_home, xbp_home2, xbp_remaining, xbpc, rem, names_rank, words_rank, a_names, c_rem, common_words, common_names, l2, last, xa, xr, chn)
+```
+
+
+
